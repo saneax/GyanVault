@@ -205,3 +205,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.venv
+digitized/*
+final_json/*
+intermediate_text/*
+scans/*
+staging/*
+json_vault/*
+conda.gpg
+staging2/*
+
