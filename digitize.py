@@ -4,6 +4,7 @@ import json
 import gc
 import torch
 import hashlib
+import re
 from pathlib import Path
 from pdf2image import convert_from_path
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -264,8 +265,17 @@ def run_pass_1_vision(args):
                 with open(raw_text_path, "w", encoding="utf-8") as f:
                     f.write(full_text_content)
                 
+                subject = row['subject']
+                # If subject is generic, try to guess from the filename
+                if subject and subject.lower() == 'download':
+                    stem = Path(rel_path).stem
+                    # Remove common codes, numbers, and series letters from the start of the filename
+                    guessed_subject = re.sub(r'^[0-9\s\(\)A-Z_-]+', '', stem, flags=re.IGNORECASE).strip()
+                    if guessed_subject: # Only replace if we found something
+                        subject = guessed_subject
+
                 meta = {
-                    "subject": row['subject'],
+                    "subject": subject, # Use the potentially improved subject
                     "class": row['class'],
                     "year": row['year'],
                     "original_path": rel_path
@@ -387,13 +397,14 @@ def run_pass_2_logic(args):
             4. **JSON SYNTAX:** Be extremely careful. All strings must be enclosed in double quotes. Any backslash `\` or double quote `"` inside a string must be escaped with a preceding backslash. For example, a LaTeX fraction like `\frac{1}{2}` must be written as `\\frac{1}{2}` in the JSON.
             5. **GENERATE ANSWERS:** For each question, provide a detailed, step-by-step answer in the `answer` field. For multiple-choice questions, state the correct option and then explain why it is correct and why the others are incorrect.
             6. **MCQ OPTIONS:** If a question has multiple-choice options like (A), (B), (C), (D), capture them in an `options` object. If there are no options, this field can be omitted.
+            7. **REFINE SUBJECT:** Based on the content, determine the precise subject and place it in the `refined_subject` field of the metadata. For example, if the context subject is "Maths Basic", the refined subject should be "Mathematics Basic".
             
             RAW OCR TEXT:
             {raw_text[:5000]}
             
             OUTPUT JSON FORMAT:
             {{
-                "metadata": {{ "subject": "{meta['subject']}", "year": "{meta['year']}" }},
+                "metadata": {{ "subject": "{meta['subject']}", "year": "{meta['year']}", "refined_subject": "Mathematics Basic" }},
                 "questions": [
                     {{
                         "q_no": "1",

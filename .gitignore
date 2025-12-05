@@ -214,4 +214,4 @@ staging/*
 json_vault/*
 conda.gpg
 staging2/*
-
+output/*
