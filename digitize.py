@@ -441,9 +441,21 @@ def run_pass_2_logic(args):
             final_path = os.path.join(FINAL_DIR, final_name)
             
             try:
-                clean_json = json_str.replace("```json", "").replace("```", "").strip()
-                # Aggressively fix unescaped backslashes from LaTeX before parsing
-                clean_json = clean_json.replace("\\", "\\\\").replace("\\\\\"", "\\\"")
+                # --- Robust JSON Extraction ---
+                # Find the first '{' and the last '}' to extract the main JSON object.
+                # This is more robust than simple cleaning, as it ignores any text,
+                # comments, or incomplete structures outside the main object.
+                start_index = json_str.find('{')
+                end_index = json_str.rfind('}')
+                if start_index != -1 and end_index != -1 and end_index > start_index:
+                    clean_json = json_str[start_index : end_index + 1]
+                else:
+                    # If no valid JSON object is found, raise an error to be caught below.
+                    raise json.JSONDecodeError("Could not find a valid JSON object in the model's output.", json_str, 0)
+                
+                # Remove trailing commas, which are a common LLM error, before parsing.
+                clean_json = re.sub(r",\s*([}\]])", r"\1", clean_json)
+                
                 parsed_json = json.loads(clean_json)
                 with open(final_path, "w", encoding="utf-8") as f:
                     json.dump(parsed_json, f, indent=2, ensure_ascii=False)
