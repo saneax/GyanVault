@@ -22,12 +22,13 @@ try:
         print("\nAttempting robust search...")
         
         query = """
-            SELECT count(*)
+            SELECT complete_url, year, class, subject, path, pdfs_json 
             FROM downloads 
             WHERE 
-                LOWER(path) LIKE '%mathematics%' 
+                LOWER(path) LIKE ? 
                 OR 
-                LOWER(pdfs_json) LIKE '%mathematics%'
+                LOWER(pdfs_json) LIKE ?
+            LIMIT 10
         """
         
         cursor.execute(query)

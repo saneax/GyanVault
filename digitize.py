@@ -321,16 +321,13 @@ def run_pass_2_logic(args):
                 with open(meta_path, 'r') as mf:
                     meta = json.load(mf)
 
-                # Only consider files that were successfully processed by Pass 1
                 if file_id not in pass1_completed_ids:
                     continue
 
-                # Skip if Pass 2 already completed this file
                 if file_id in pass2_completed_ids:
                     print(f"-> Skipping (Pass 2 completed): {file_id}")
                     continue
                 
-                # Check if the final JSON already exists
                 final_path_check = os.path.join(FINAL_DIR, f"{file_id}_{meta.get('subject', 'unknown')}.json")
                 if os.path.exists(final_path_check):
                     print(f"-> Skipping (final JSON already exists): {file_id}")
@@ -342,7 +339,6 @@ def run_pass_2_logic(args):
         return
 
     print(">>> Loading Logic Model (Qwen2-7B-Instruct)...")
-    # Use the base model and quantize it on-the-fly, just like in Pass 1
     model_id = "Qwen/Qwen2-7B-Instruct"
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -350,138 +346,187 @@ def run_pass_2_logic(args):
         bnb_4bit_compute_dtype=torch.bfloat16
     )
 
-    # Address the attention_mask warning by setting a pad_token if it's not already set.
-    # The EOS token is a common and safe choice for padding with causal language models.
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = None # Initialize model to None
+    
+    model = None
     try:
-        # Load with the 4-bit config
         model = AutoModelForCausalLM.from_pretrained(
             model_id, quantization_config=bnb_config, device_map="auto"
         )
     except Exception as e:
         print(f"!! Error loading Logic Model: {e}")
         cleanup_gpu()
-        return # Exit if model can't be loaded
+        return
 
-    try: # Main processing loop wrapped in try-except for KeyboardInterrupt
+    try:
         for filename, meta, file_id in pending_files_for_pass2:
             if args.max_files > 0 and files_processed_count >= args.max_files:
                 print(f"-> Reached maximum number of files to process ({args.max_files}). Stopping Pass 2.")
-                return # Exit the function, finally block will be executed
+                return
 
             print(f"-> Structuring JSON for {meta.get('subject')} (File ID: {file_id})")
 
             with open(os.path.join(STAGING_DIR, filename), "r", encoding="utf-8") as f:
                 raw_text = f.read()
 
-
-            prompt = rf"""
-            You are a CBSE Question Paper digitization expert.
+            # Chunk the raw text if it's too long to avoid token overflow
+            # Split by "PAGE" markers or by question numbers
+            text_chunks = []
+            current_chunk = ""
+            chunk_size = 3000  # characters per chunk
             
-            CONTEXT:
-            Subject: {meta['subject']}
-            Class: {meta['class']}
-            Year: {meta['year']}
-            Source File: {meta.get('original_path', 'N/A')}
-            
-            TASK:
-            Convert the OCR text into clean JSON.
-            
-            RULES:
-            1. **LANGUAGE FILTER:** The text contains both Hindi and English. **Extract ONLY the English version** of the questions. Ignore the Hindi translation entirely.
-            2. **DIAGRAMS:** If you find a `[DIAGRAM: ...]` tag, include its description in the `diagram_description` field. If there is no diagram, set `diagram_description` to "N/A".
-            3. **STRUCTURE:** Output a strict JSON list of questions.
-            4. **JSON SYNTAX:** Be extremely careful. All strings must be enclosed in double quotes. Any backslash `\` or double quote `"` inside a string must be escaped with a preceding backslash. For example, a LaTeX fraction like `\frac{1}{2}` must be written as `\\frac{1}{2}` in the JSON.
-            5. **GENERATE ANSWERS:** For each question, provide a detailed, step-by-step answer in the `answer` field. For multiple-choice questions, state the correct option and then explain why it is correct and why the others are incorrect.
-            6. **MCQ OPTIONS:** If a question has multiple-choice options like (A), (B), (C), (D), capture them in an `options` object. If there are no options, this field can be omitted.
-            7. **REFINE SUBJECT:** Based on the content, determine the precise subject and place it in the `refined_subject` field of the metadata. For example, if the context subject is "Maths Basic", the refined subject should be "Mathematics Basic".
-            
-            RAW OCR TEXT:
-            {raw_text[:5000]}
-            
-            OUTPUT JSON FORMAT:
-            {{
-                "metadata": {{ "subject": "{meta['subject']}", "year": "{meta['year']}", "refined_subject": "Mathematics Basic" }},
-                "questions": [
-                    {{
-                        "q_no": "1",
-                        "text": "Domain of \\sin^{-1}(2x^2 - 3) is :",
-                        "options": {{
-                            "A": "(-1, 0) \\cup (1, \\sqrt{2})",
-                            "B": "(- \\sqrt{2}, -1) \\cup (0, 1)",
-                            "C": "[- \\sqrt{2}, -1] \\cup [1, \\sqrt{2}]",
-                            "D": "(- \\sqrt{2}, -1) \\cup (1, \\sqrt{2})"
-                        }},
-                        "diagram_description": "N/A",
-                        "marks": "1",
-                        "answer": "The correct option is (C). The domain of sin^{-1}(u) is the set of values for which -1 <= u <= 1. In this case, u = 2x^2 - 3. So we solve the inequality -1 <= 2x^2 - 3 <= 1..."
-                    }}
-                ]
-            }}
-            """
-    
-            messages = [
-                {"role": "system", "content": "Output valid JSON only."},
-                {"role": "user", "content": prompt}
-            ]
-    
-            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = tokenizer([text], padding=True, return_tensors="pt").to("cuda")
-            
-            with torch.no_grad():
-                outputs = model.generate(inputs.input_ids, max_new_tokens=2048, temperature=0.1)
-                
-            generated_ids = [out[len(inp):] for inp, out in zip(inputs.input_ids, outputs)]
-            json_str = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    
-            final_name = f"{file_id}_{meta.get('subject', 'unknown')}.json"
-            final_path = os.path.join(FINAL_DIR, final_name)
-            
-            try:
-                # --- Robust JSON Extraction ---
-                # Find the first '{' and the last '}' to extract the main JSON object.
-                # This is more robust than simple cleaning, as it ignores any text,
-                # comments, or incomplete structures outside the main object.
-                start_index = json_str.find('{')
-                end_index = json_str.rfind('}')
-                if start_index != -1 and end_index != -1 and end_index > start_index:
-                    clean_json = json_str[start_index : end_index + 1]
+            for line in raw_text.split('\n'):
+                if len(current_chunk) > chunk_size and ('---' in line or re.match(r'^\d+\.', line)):
+                    text_chunks.append(current_chunk)
+                    current_chunk = line + "\n"
                 else:
-                    # If no valid JSON object is found, raise an error to be caught below.
-                    raise json.JSONDecodeError("Could not find a valid JSON object in the model's output.", json_str, 0)
+                    current_chunk += line + "\n"
+            if current_chunk:
+                text_chunks.append(current_chunk)
+
+            # Process in chunks and merge results
+            all_questions = []
+            chunk_metadata = None
+            
+            for chunk_idx, chunk_text in enumerate(text_chunks):
+                print(f"   Processing chunk {chunk_idx + 1}/{len(text_chunks)}...")
                 
-                # Remove trailing commas, which are a common LLM error, before parsing.
-                clean_json = re.sub(r",\s*([}\]])", r"\1", clean_json)
+                prompt = rf"""
+You are a CBSE Question Paper digitization expert.
+
+CONTEXT:
+Subject: {meta['subject']}
+Class: {meta['class']}
+Year: {meta['year']}
+Source File: {meta.get('original_path', 'N/A')}
+Chunk: {chunk_idx + 1}/{len(text_chunks)}
+
+TASK:
+Convert the OCR text into clean JSON. Output ONLY valid JSON, no markdown, no explanations.
+
+RULES:
+1. **LANGUAGE FILTER:** Extract ONLY English questions. Ignore Hindi entirely.
+2. **DIAGRAMS:** Include `[DIAGRAM: ...]` descriptions or set to "N/A".
+3. **JSON SYNTAX:** All backslashes in LaTeX must be escaped: `\\sin` → `\\\\sin`
+4. **INCOMPLETE QUESTIONS:** If a question is cut off mid-sentence, DO NOT include it. Only include complete questions.
+5. **GENERATE ANSWERS:** Provide step-by-step explanations.
+6. **MCQ OPTIONS:** Capture (A), (B), (C), (D) in an options object.
+
+RAW OCR TEXT:
+{chunk_text[:2500]}
+
+OUTPUT ONLY THIS JSON (no other text):
+{{
+    "metadata": {{"subject": "{meta['subject']}", "year": "{meta['year']}", "refined_subject": ""}},
+    "questions": []
+}}
+
+If there are no complete questions in this chunk, return an empty questions array.
+"""
+
+                messages = [
+                    {"role": "system", "content": "Output ONLY valid JSON. No markdown, no explanations."},
+                    {"role": "user", "content": prompt}
+                ]
+
+                text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = tokenizer([text], padding=True, return_tensors="pt").to("cuda")
                 
-                parsed_json = json.loads(clean_json)
+                # Add explicit attention mask
+                if 'attention_mask' not in inputs:
+                    inputs['attention_mask'] = (inputs.input_ids != tokenizer.pad_token_id).int()
+                
+                with torch.no_grad():
+                    outputs = model.generate(
+                        inputs.input_ids, 
+                        attention_mask=inputs['attention_mask'],
+                        max_new_tokens=1500,  # Reduced to force shorter, complete responses
+                        temperature=0.1,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id
+                    )
+                    
+                generated_ids = [out[len(inp):] for inp, out in zip(inputs.input_ids, outputs)]
+                json_str = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+                final_name = f"{file_id}_{meta.get('subject', 'unknown')}.json"
+                final_path = os.path.join(FINAL_DIR, final_name)
+                
+                try:
+                    # Extract JSON with more robust parsing
+                    start_index = json_str.find('{')
+                    end_index = json_str.rfind('}')
+                    
+                    if start_index == -1 or end_index == -1 or end_index <= start_index:
+                        print(f"   [Warn] No valid JSON in chunk {chunk_idx + 1}. Skipping.")
+                        continue
+                    
+                    clean_json = json_str[start_index : end_index + 1]
+                    clean_json = re.sub(r",\s*([}\]])", r"\1", clean_json)
+                    
+                    # Attempt to parse and validate
+                    parsed_json = json.loads(clean_json)
+                    
+                    # Validate questions are complete
+                    if "questions" in parsed_json:
+                        validated_questions = []
+                        for q in parsed_json["questions"]:
+                            # Check if question has required fields
+                            if all(k in q for k in ["q_no", "text", "marks"]):
+                                # Check if text ends properly (not cut off)
+                                if q["text"].strip().endswith((":", "?", ".")):
+                                    validated_questions.append(q)
+                                else:
+                                    print(f"   [Warn] Skipping incomplete question {q.get('q_no', '?')}")
+                        
+                        all_questions.extend(validated_questions)
+                    
+                    if "metadata" in parsed_json:
+                        chunk_metadata = parsed_json["metadata"]
+                    
+                except json.JSONDecodeError as e:
+                    print(f"   [Warn] JSON parse error in chunk {chunk_idx + 1}: {e}. Saving to .err file.")
+                    with open(final_path + f".err.chunk{chunk_idx}", "w", encoding="utf-8") as f:
+                        f.write(json_str)
+                except Exception as e:
+                    print(f"   [Warn] Error processing chunk {chunk_idx + 1}: {e}")
+                
+                del inputs, outputs
+                cleanup_gpu()
+            
+            # Merge all chunks into final output
+            if all_questions:
+                final_output = {
+                    "metadata": chunk_metadata or {
+                        "subject": meta['subject'],
+                        "year": meta['year'],
+                        "refined_subject": meta.get('subject', '')
+                    },
+                    "questions": all_questions
+                }
+                
                 with open(final_path, "w", encoding="utf-8") as f:
-                    json.dump(parsed_json, f, indent=2, ensure_ascii=False)
-                print(f"   [Success] Saved {final_name}")
-                pass2_completed_ids.add(file_id) # Mark as completed in state
-                files_processed_count += 1 # Increment after successful processing
-            except json.JSONDecodeError as e: # Catch specific exception for clarity
-                print(f"   [Fail] JSON invalid for {file_id}. Error: {e}. Saving raw output to .err file.")
+                    json.dump(final_output, f, indent=2, ensure_ascii=False)
+                
+                print(f"   [Success] Saved {final_name} with {len(all_questions)} valid questions")
+                pass2_completed_ids.add(file_id)
+                files_processed_count += 1
+            else:
+                print(f"   [Fail] No valid questions extracted for {file_id}. Saving raw output.")
                 with open(final_path + ".err", "w", encoding="utf-8") as f:
                     f.write(json_str)
-            except Exception as e: # Catch other unexpected errors
-                print(f"   [Fail] An unexpected error occurred for {file_id}: {e}. Saving raw output to .err file.")
-                with open(final_path + ".err", "w", encoding="utf-8") as f:
-                    f.write(json_str)
-        
-            del inputs, outputs
-            cleanup_gpu()
 
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt detected. Saving state and exiting Pass 2 gracefully.")
     except Exception as e:
         print(f"\nAn unexpected error occurred in Pass 2: {e}")
     finally:
-        if 'model' in locals() and model: # Ensure model is deleted only if it was loaded
+        if 'model' in locals() and model:
             del model
-        if 'tokenizer' in locals() and tokenizer: # Ensure tokenizer is deleted only if it was loaded
+        if 'tokenizer' in locals() and tokenizer:
             del tokenizer
         cleanup_gpu()
         save_processing_state(pass1_completed_ids, pass2_completed_ids)
@@ -545,7 +590,7 @@ def main():
     print(f"  - Max Files: {args.max_files if args.max_files > 0 else 'No Limit'}")
     print(f"  - Offset: {args.offset}")
 
-    run_pass_1_vision(args)
+    # run_pass_1_vision(args)
     run_pass_2_logic(args)
 
 if __name__ == "__main__":
