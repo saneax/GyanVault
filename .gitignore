@@ -215,3 +215,5 @@ json_vault/*
 conda.gpg
 staging2/*
 output/*
+debug_staging/*
+debug_final/*

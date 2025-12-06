@@ -304,6 +304,29 @@ def run_pass_1_vision(args):
 # =========================================================================
 # PHASE 2: LOGIC & JSON FORMATTING (The "Brain")
 # =========================================================================
+def sanitize_latex_in_json(json_str):
+    """
+    Fix common LaTeX escaping issues in JSON strings before parsing.
+    Converts single backslashes to double backslashes in LaTeX commands.
+    """
+    # Pattern: Match backslash followed by a letter (LaTeX command start)
+    # But NOT if it's already double-backslashed
+    
+    # First pass: Find all \command patterns that aren't already escaped
+    import re
+    
+    # Matches: \sin, \cos, \frac, \sqrt, \pi, etc. (single backslash followed by letters)
+    # Negative lookbehind to avoid replacing already-escaped sequences
+    json_str = re.sub(r'(?<!\\)\\([a-zA-Z]+)', r'\\\\\1', json_str)
+    
+    # Handle special cases: \{ \} \[ \] 
+    json_str = re.sub(r'(?<!\\)\\([{}[\]])', r'\\\\\1', json_str)
+    
+    # Handle \^ \_ \- etc.
+    json_str = re.sub(r'(?<!\\)\\([_^-])', r'\\\\\1', json_str)
+    
+    return json_str
+
 def run_pass_2_logic(args):
     print("\n" + "="*50)
     print(">>> PASS 2: LOGIC & JSON FORMATTING")
@@ -372,10 +395,9 @@ def run_pass_2_logic(args):
                 raw_text = f.read()
 
             # Chunk the raw text if it's too long to avoid token overflow
-            # Split by "PAGE" markers or by question numbers
             text_chunks = []
             current_chunk = ""
-            chunk_size = 3000  # characters per chunk
+            chunk_size = 3000
             
             for line in raw_text.split('\n'):
                 if len(current_chunk) > chunk_size and ('---' in line or re.match(r'^\d+\.', line)):
@@ -386,13 +408,13 @@ def run_pass_2_logic(args):
             if current_chunk:
                 text_chunks.append(current_chunk)
 
-            # Process in chunks and merge results
             all_questions = []
             chunk_metadata = None
             
             for chunk_idx, chunk_text in enumerate(text_chunks):
                 print(f"   Processing chunk {chunk_idx + 1}/{len(text_chunks)}...")
                 
+                # IMPROVED PROMPT: Explicitly instruct about backslash escaping
                 prompt = rf"""
 You are a CBSE Question Paper digitization expert.
 
@@ -406,35 +428,50 @@ Chunk: {chunk_idx + 1}/{len(text_chunks)}
 TASK:
 Convert the OCR text into clean JSON. Output ONLY valid JSON, no markdown, no explanations.
 
-RULES:
-1. **LANGUAGE FILTER:** Extract ONLY English questions. Ignore Hindi entirely.
-2. **DIAGRAMS:** Include `[DIAGRAM: ...]` descriptions or set to "N/A".
-3. **JSON SYNTAX:** All backslashes in LaTeX must be escaped: `\\sin` → `\\\\sin`
-4. **INCOMPLETE QUESTIONS:** If a question is cut off mid-sentence, DO NOT include it. Only include complete questions.
-5. **GENERATE ANSWERS:** Provide step-by-step explanations.
-6. **MCQ OPTIONS:** Capture (A), (B), (C), (D) in an options object.
+CRITICAL RULES FOR JSON OUTPUT:
+1. Every JSON string must be enclosed in double quotes "..."
+2. Every backslash inside a string MUST be escaped. For example:
+   - LaTeX command \sin must be written as "\\sin" in JSON
+   - LaTeX command \frac must be written as "\\frac" in JSON
+   - Backslashes in math: "x = \\sqrt{{a + b}}"
+3. Double quotes inside strings must be escaped: \"
+4. Extract ONLY English questions. Ignore Hindi entirely.
+5. If a question is incomplete or cut off, DO NOT include it.
+6. For MCQ, capture options (A), (B), (C), (D) in an options object.
+7. Include diagram descriptions in [DIAGRAM: ...] or set to "N/A".
+
+EXAMPLE OF CORRECT JSON OUTPUT:
+{{
+    "metadata": {{"subject": "Mathematics", "year": "{meta['year']}", "refined_subject": ""}},
+    "questions": [
+        {{
+            "q_no": "1",
+            "text": "Find the domain of \\\\sin^{{-1}}(2x - 1).",
+            "options": {{
+                "A": "[0, 1]",
+                "B": "[0.5, 1]",
+                "C": "[-1, 1]"
+            }},
+            "marks": "2",
+            "answer": "Using \\\\sin^{{-1}}(u) requires -1 <= u <= 1. So -1 <= 2x - 1 <= 1 means 0 <= x <= 1. Answer: [0, 1]"
+        }}
+    ]
+}}
 
 RAW OCR TEXT:
 {chunk_text[:2500]}
 
-OUTPUT ONLY THIS JSON (no other text):
-{{
-    "metadata": {{"subject": "{meta['subject']}", "year": "{meta['year']}", "refined_subject": ""}},
-    "questions": []
-}}
-
-If there are no complete questions in this chunk, return an empty questions array.
+OUTPUT ONLY THE JSON (no markdown, no code blocks, no explanations):
 """
 
                 messages = [
-                    {"role": "system", "content": "Output ONLY valid JSON. No markdown, no explanations."},
+                    {"role": "system", "content": "You are a JSON generation expert. Output ONLY valid, properly escaped JSON."},
                     {"role": "user", "content": prompt}
                 ]
 
                 text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 inputs = tokenizer([text], padding=True, return_tensors="pt").to("cuda")
                 
-                # Add explicit attention mask
                 if 'attention_mask' not in inputs:
                     inputs['attention_mask'] = (inputs.input_ids != tokenizer.pad_token_id).int()
                 
@@ -442,8 +479,7 @@ If there are no complete questions in this chunk, return an empty questions arra
                     outputs = model.generate(
                         inputs.input_ids, 
                         attention_mask=inputs['attention_mask'],
-                        max_new_tokens=1500,  # Reduced to force shorter, complete responses
-                        temperature=0.1,
+                        max_new_tokens=1500,
                         do_sample=False,
                         pad_token_id=tokenizer.pad_token_id,
                         eos_token_id=tokenizer.eos_token_id
@@ -456,7 +492,7 @@ If there are no complete questions in this chunk, return an empty questions arra
                 final_path = os.path.join(FINAL_DIR, final_name)
                 
                 try:
-                    # Extract JSON with more robust parsing
+                    # Extract JSON boundaries
                     start_index = json_str.find('{')
                     end_index = json_str.rfind('}')
                     
@@ -465,22 +501,25 @@ If there are no complete questions in this chunk, return an empty questions arra
                         continue
                     
                     clean_json = json_str[start_index : end_index + 1]
+                    
+                    # CRITICAL: Apply LaTeX sanitization BEFORE parsing
+                    clean_json = sanitize_latex_in_json(clean_json)
+                    
+                    # Remove trailing commas
                     clean_json = re.sub(r",\s*([}\]])", r"\1", clean_json)
                     
-                    # Attempt to parse and validate
+                    # Attempt to parse
                     parsed_json = json.loads(clean_json)
                     
-                    # Validate questions are complete
+                    # Validate questions
                     if "questions" in parsed_json:
                         validated_questions = []
                         for q in parsed_json["questions"]:
-                            # Check if question has required fields
                             if all(k in q for k in ["q_no", "text", "marks"]):
-                                # Check if text ends properly (not cut off)
                                 if q["text"].strip().endswith((":", "?", ".")):
                                     validated_questions.append(q)
                                 else:
-                                    print(f"   [Warn] Skipping incomplete question {q.get('q_no', '?')}")
+                                    print(f"   [Warn] Skipping incomplete Q{q.get('q_no', '?')}")
                         
                         all_questions.extend(validated_questions)
                     
@@ -488,7 +527,7 @@ If there are no complete questions in this chunk, return an empty questions arra
                         chunk_metadata = parsed_json["metadata"]
                     
                 except json.JSONDecodeError as e:
-                    print(f"   [Warn] JSON parse error in chunk {chunk_idx + 1}: {e}. Saving to .err file.")
+                    print(f"   [Warn] JSON parse error in chunk {chunk_idx + 1}: {e}")
                     with open(final_path + f".err.chunk{chunk_idx}", "w", encoding="utf-8") as f:
                         f.write(json_str)
                 except Exception as e:
@@ -497,7 +536,7 @@ If there are no complete questions in this chunk, return an empty questions arra
                 del inputs, outputs
                 cleanup_gpu()
             
-            # Merge all chunks into final output
+            # Merge all chunks
             if all_questions:
                 final_output = {
                     "metadata": chunk_metadata or {
@@ -511,13 +550,11 @@ If there are no complete questions in this chunk, return an empty questions arra
                 with open(final_path, "w", encoding="utf-8") as f:
                     json.dump(final_output, f, indent=2, ensure_ascii=False)
                 
-                print(f"   [Success] Saved {final_name} with {len(all_questions)} valid questions")
+                print(f"   [Success] Saved {final_name} with {len(all_questions)} questions")
                 pass2_completed_ids.add(file_id)
                 files_processed_count += 1
             else:
-                print(f"   [Fail] No valid questions extracted for {file_id}. Saving raw output.")
-                with open(final_path + ".err", "w", encoding="utf-8") as f:
-                    f.write(json_str)
+                print(f"   [Fail] No valid questions extracted for {file_id}")
 
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt detected. Saving state and exiting Pass 2 gracefully.")
