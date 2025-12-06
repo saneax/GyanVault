@@ -92,7 +92,7 @@ def run_pass_1_vision(pdf_path, file_id):
 
             messages = [{"role": "user", "content": [
                 {"type": "image", "image": image},
-                {"type": "text", "text": "Transcribe this page line-by-line. Preserve LaTeX and Hindi text."}
+                {"type": "text", "text": "Transcribe this page line-by-line. IMPORTANT: Only transcribe the English text. Ignore all Hindi text."}
             ]}]
 
             text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -123,23 +123,6 @@ def run_pass_1_vision(pdf_path, file_id):
 
     return raw_text_path
 
-def preprocess_raw_text(raw_text):
-    """
-    Preprocesses the raw OCR text to isolate and clean the relevant question sections.
-    1. Finds the start of the actual questions (e.g., "SECTION A").
-    2. Filters out all non-ASCII (non-English) characters.
-    """
-    # Find the starting point of the questions
-    start_marker_eng = "SECTION A"
-    start_marker_hin = "खण्ड क"
-    start_pos_eng = raw_text.find(start_marker_eng)
-    start_pos_hin = raw_text.find(start_marker_hin)
-
-    start_pos = min(p for p in [start_pos_eng, start_pos_hin] if p != -1) if any(p != -1 for p in [start_pos_eng, start_pos_hin]) else 0
-    
-    # Keep only ASCII characters (i.e., English and standard symbols)
-    return "".join(char for char in raw_text[start_pos:] if ord(char) < 128)
-
 def run_pass_2_logic(raw_text_path, file_id, metadata):
     """Runs the logic model to convert raw text to structured JSON."""
     print("\n" + "="*30)
@@ -159,14 +142,13 @@ def run_pass_2_logic(raw_text_path, file_id, metadata):
         with open(raw_text_path, "r", encoding="utf-8") as f:
             raw_text = f.read()
 
-        # NEW: Preprocess the text to make it easier for the model
-        print("  - Preprocessing text (keeping English only, finding question start)...")
-        clean_text = preprocess_raw_text(raw_text)
-
         # 2. Generate JSON
         # REINFORCED PROMPT: More explicit instructions and a detailed example.
+        # The prompt now receives cleaner text directly from Pass 1.
         prompt = rf"""
 <|im_start|>system
+You are an expert data extractor. Your task is to convert the given text into a single, valid JSON object. You will only output the JSON object and nothing else.
+Crucially, you must escape all backslashes required by the JSON format. For example, a LaTeX command like `\sqrt` must be represented as `"\\sqrt"` in the JSON string.<|im_end|>
 You are an expert data extraction engine for academic papers. Your task is to convert the provided text into a single, valid JSON object.
 
 CRITICAL RULES:
@@ -196,8 +178,8 @@ CONTEXT:
 - Class: {metadata.get('class', 'N/A')}
 - Year: {metadata.get('year', 'N/A')}
 
-CLEANED ENGLISH TEXT TO CONVERT:
-{clean_text[:4000]}
+RAW ENGLISH TEXT TO CONVERT:
+{raw_text[:4000]}
 <|im_end|>
 <|im_start|>assistant
         """
@@ -235,55 +217,48 @@ CLEANED ENGLISH TEXT TO CONVERT:
         cleanup_gpu()
         print("  Pass 2 Model Unloaded.")
 
-def get_metadata_for_id(file_id):
-    """Fetches metadata from the database for a given file_id by reverse-searching the path."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    # This is a bit of a brute-force search, but necessary since we only have the ID.
-    cursor.execute("SELECT complete_url, year, class, subject, path, pdfs_json FROM downloads")
-    records = cursor.fetchall()
-    conn.close()
+def main():
+    parser = argparse.ArgumentParser(description="Debug the digitization pipeline on a few random files.")
+    parser.add_argument("subject", type=str, help="The subject to search for (e.g., 'Mathematics').")
+    parser.add_argument("num_pdfs", type=int, nargs='?', default=2, help="Number of random PDF files to process. Default: 2.")
+    args = parser.parse_args()
+
+    records = find_random_pdfs(args.subject, args.num_pdfs)
+
+    if not records:
+        print("No files found to process. Exiting.")
+        return
 
     for row in records:
-        # Re-generate the ID from the path to find the matching record
+        # --- Discover PDF path from DB record ---
         rel_path = None
         if row['pdfs_json'] and row['pdfs_json'] != "[]":
             try:
                 pdf_list = json.loads(row['pdfs_json'])
-                if pdf_list: rel_path = pdf_list[0]['file']
-            except json.JSONDecodeError: pass
+                if pdf_list:
+                    rel_path = pdf_list[0]['file'] # Just take the first PDF from a zip
+            except json.JSONDecodeError:
+                pass
         
         if not rel_path and row['path'] and row['path'].lower().endswith('.pdf'):
             rel_path = str(Path(row['path']).relative_to(ROOT_OUTPUT_DIR))
 
-        if rel_path and get_unique_file_id(str(rel_path)) == file_id:
-            return dict(row)
-            
-    return None
-
-def main():
-    # MODIFIED: Skip Pass 1 and directly scan the debug_staging directory.
-    print("Scanning for existing raw text files in ./debug_staging/...")
-    
-    staged_files = [f for f in os.listdir(DEBUG_STAGING_DIR) if f.endswith("_raw.txt")]
-
-    if not staged_files:
-        print("No '_raw.txt' files found in ./debug_staging/.")
-        return
-
-    print(f"Found {len(staged_files)} files to process for Pass 2.")
-
-    for txt_filename in staged_files:
-        file_id = txt_filename.split("_raw.txt")[0]
-        raw_text_file = os.path.join(DEBUG_STAGING_DIR, txt_filename)
-        
-        print(f"\n{'='*50}\nProcessing file ID: {file_id}\n{'='*50}")
-        
-        metadata = get_metadata_for_id(file_id)
-
-        if not metadata:
-            print(f"  !! Error: Could not find metadata in the database for file ID '{file_id}'. Skipping.")
+        if not rel_path:
+            print(f"Could not determine a PDF path for record URL: {row['complete_url']}. Skipping.")
             continue
+
+        full_pdf_path = Path(ROOT_OUTPUT_DIR) / rel_path
+        if not full_pdf_path.exists():
+            print(f"File not found on disk: {full_pdf_path}. Skipping.")
+            continue
+
+        file_id = get_unique_file_id(str(rel_path))
+        metadata = dict(row)
+
+        print(f"\n{'='*50}\nProcessing file: {full_pdf_path}\n{'='*50}")
+
+        # --- Run the two passes sequentially ---
+        raw_text_file = run_pass_1_vision(full_pdf_path, file_id)
 
         if raw_text_file:
             run_pass_2_logic(raw_text_file, file_id, metadata)
