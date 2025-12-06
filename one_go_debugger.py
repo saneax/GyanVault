@@ -67,6 +67,32 @@ def find_random_pdfs(subject, num_pdfs):
         conn.close()
         return []
 
+def find_staged_files(num_files):
+    """Finds random raw text files in the staging directory and gets their metadata."""
+    print(f"Searching for {num_files} random processed files in: '{DEBUG_STAGING_DIR}'")
+    staged_files = [f for f in os.listdir(DEBUG_STAGING_DIR) if f.endswith("_raw.txt")]
+
+    if not staged_files:
+        return []
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # This is inefficient, but for a debug script it's acceptable.
+    # It iterates through the DB to find records matching the staged files.
+    cursor.execute("SELECT complete_url, year, class, subject, path, pdfs_json FROM downloads")
+    all_records = cursor.fetchall()
+    conn.close()
+
+    found_records = []
+    for record in all_records:
+        rel_path = get_rel_path_from_record(record)
+        if rel_path:
+            file_id = get_unique_file_id(str(rel_path))
+            if f"{file_id}_raw.txt" in staged_files:
+                found_records.append(record)
+
+    return found_records[:num_files] # Return the requested number of files
+
 def run_pass_1_vision(pdf_path, file_id):
     """Runs the vision model to perform OCR on a single PDF."""
     print("\n" + "="*30)
@@ -104,7 +130,10 @@ def run_pass_1_vision(pdf_path, file_id):
 
             generated_ids_trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
             page_text = processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
-            full_text_content += f"\n--- PAGE {i+1} ---\n{page_text}\n"
+
+            # AGGRESSIVE FILTER: Remove all non-ASCII characters to guarantee English-only text.
+            page_text_english_only = "".join(char for char in page_text if ord(char) < 128)
+            full_text_content += f"\n--- PAGE {i+1} ---\n{page_text_english_only}\n"
             del inputs, generated_ids
             cleanup_gpu()
 
@@ -138,76 +167,79 @@ def run_pass_2_logic(raw_text_path, file_id, metadata):
     final_path = os.path.join(DEBUG_FINAL_DIR, f"{file_id}_{metadata.get('subject', 'unknown')}.json")
     error_path = final_path + ".err"
 
-    try:
-        with open(raw_text_path, "r", encoding="utf-8") as f:
-            raw_text = f.read()
+    all_questions = []
 
-        # 2. Generate JSON
-        # REINFORCED PROMPT: More explicit instructions and a detailed example.
-        # The prompt now receives cleaner text directly from Pass 1.
-        prompt = rf"""
+    try:
+        # CHUNKING IMPLEMENTED: Process the document page by page.
+        system_prompt = """
 <|im_start|>system
-You are an expert data extractor. Your task is to convert the given text into a single, valid JSON object. You will only output the JSON object and nothing else.
-Crucially, you must escape all backslashes required by the JSON format. For example, a LaTeX command like `\sqrt` must be represented as `"\\sqrt"` in the JSON string.<|im_end|>
 You are an expert data extraction engine for academic papers. Your task is to convert the provided text into a single, valid JSON object.
 
 CRITICAL RULES:
 1. You MUST output a single, valid JSON object and nothing else. Do not use markdown.
 2. You MUST escape all backslashes for JSON compatibility. For example, `\sin` becomes `"\\sin"`.
-3. Extract questions, their options (for MCQs), and marks.
-4. For the "explanation" field, provide a detailed, step-by-step walkthrough of how to arrive at the correct answer. Behave like a teacher explaining the concept.
-5. Ignore any leftover instructional text or page markers. Focus only on the questions.
-
-EXAMPLE JSON STRUCTURE:
-{{
-  "questions": [
-    {{
-      "q_no": "1",
-      "text": "If \(100 \\equiv x(\\bmod 7)\\), then the least positive value of \(x\) is :",
-      "options": ["(a) 6", "(b) 4", "(c) 3", "(d) 2"],
-      "marks": "1",
-      "answer": "The correct option is (d) 2.",
-      "explanation": "The expression \\(100 \\equiv x(\\bmod 7)\\) means that 100 and x have the same remainder when divided by 7. First, we divide 100 by 7. 100 divided by 7 is 14 with a remainder of 2 (since 14 * 7 = 98). Therefore, the remainder is 2. The question asks for the least positive value of x, which is this remainder. So, x = 2."
-    }}
-  ]
-}}
+3. Extract all questions, including their number, text, options (for MCQs), and marks.
+4. Ignore any leftover instructional text or page markers. Focus only on the questions.
+5. The output must be a JSON object containing a single key "questions", which is a list of question objects.
 <|im_end|>
+"""
+
+        with open(raw_text_path, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+
+        # Split the document into pages based on our marker from Pass 1
+        pages = raw_text.split("--- PAGE")[1:]
+
+        for i, page_content in enumerate(pages):
+            print(f"  - Pass 2: Processing Page {i+1}/{len(pages)}")
+            
+            user_prompt = f"""
 <|im_start|>user
 CONTEXT:
 - Subject: {metadata.get('subject', 'N/A')}
 - Class: {metadata.get('class', 'N/A')}
 - Year: {metadata.get('year', 'N/A')}
 
-RAW ENGLISH TEXT TO CONVERT:
-{raw_text[:4000]}
-<|im_end|>
+PAGE TEXT TO CONVERT:
+```text
+{page_content}
+```<|im_end|>
 <|im_start|>assistant
-        """
-        inputs = tokenizer([prompt], return_tensors="pt").to("cuda")
+"""
+            inputs = tokenizer([system_prompt + user_prompt], return_tensors="pt").to("cuda")
 
-        with torch.no_grad():
-            outputs = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, max_new_tokens=3072, temperature=0.1, pad_token_id=tokenizer.eos_token_id)
-        
-        generated_ids = [out[len(inp):] for inp, out in zip(inputs.input_ids, outputs)]
-        json_str = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            with torch.no_grad():
+                outputs = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, max_new_tokens=3072, temperature=0.1, pad_token_id=tokenizer.eos_token_id)
 
-        # 3. Clean and Save
-        try:
-            clean_json_str = json_str[json_str.find('{') : json_str.rfind('}')+1]
-            # This regex is more robust. It finds any single backslash that is not
-            # already escaped and escapes it. This is a critical step to fix model
-            # errors before parsing. It handles cases like `\n`, `\t`, `\(` and `\s` etc.
-            # It looks for a `\` that is not followed by another `\` (negative lookahead).
-            corrected_json_str = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', clean_json_str)
+            generated_ids = [out[len(inp):] for inp, out in zip(inputs.input_ids, outputs)]
+            json_str = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-            parsed_json = json.loads(corrected_json_str)
+            try:
+                clean_json_str = json_str[json_str.find('{') : json_str.rfind('}')+1]
+                if not clean_json_str: continue
+
+                corrected_json_str = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', clean_json_str)
+                parsed_json = json.loads(corrected_json_str)
+
+                if "questions" in parsed_json and isinstance(parsed_json["questions"], list):
+                    all_questions.extend(parsed_json["questions"])
+
+            except json.JSONDecodeError as e:
+                print(f"    [Warn] JSON was invalid on page {i+1}: {e}. Saving raw output to {error_path}.page{i+1}")
+                with open(f"{error_path}.page{i+1}", "w", encoding="utf-8") as f_err:
+                    f_err.write(json_str)
+            finally:
+                del inputs, outputs, generated_ids
+                cleanup_gpu()
+
+        # After processing all pages, assemble the final document
+        if all_questions:
+            final_document = {"questions": all_questions}
             with open(final_path, "w", encoding="utf-8") as f:
-                json.dump(parsed_json, f, indent=2, ensure_ascii=False)
-            print(f"  [Success] Final JSON saved to {final_path}")
-        except json.JSONDecodeError as e:
-            print(f"  [Fail] JSON was invalid: {e}. Saving raw output to {error_path}")
-            with open(error_path, "w", encoding="utf-8") as f:
-                f.write(json_str)
+                json.dump(final_document, f, indent=2, ensure_ascii=False)
+            print(f"  [Success] Final JSON saved to {final_path} with {len(all_questions)} questions.")
+        else:
+            print(f"  [Fail] No questions could be extracted from any page.")
 
     except Exception as e:
         print(f"  !! Error in Pass 2: {e}")
@@ -217,51 +249,79 @@ RAW ENGLISH TEXT TO CONVERT:
         cleanup_gpu()
         print("  Pass 2 Model Unloaded.")
 
+def get_rel_path_from_record(record_row):
+    """Extracts the relative file path from a database row."""
+    rel_path = None
+    if record_row['pdfs_json'] and record_row['pdfs_json'] != "[]":
+        try:
+            pdf_list = json.loads(record_row['pdfs_json'])
+            if pdf_list:
+                rel_path = pdf_list[0]['file'] # Just take the first PDF from a zip
+        except json.JSONDecodeError:
+            pass
+    
+    if not rel_path and record_row['path'] and record_row['path'].lower().endswith('.pdf'):
+        rel_path = str(Path(record_row['path']).relative_to(ROOT_OUTPUT_DIR))
+    
+    return rel_path
+
+def process_file(row, run_pass_mode):
+    """Processes a single file based on the selected pass mode."""
+    rel_path = get_rel_path_from_record(row)
+    if not rel_path:
+        print(f"Could not determine a PDF path for record URL: {row['complete_url']}. Skipping.")
+        return
+
+    if run_pass_mode != '2': # For pass 1 or all, we need the actual PDF
+        full_pdf_path = Path(ROOT_OUTPUT_DIR) / rel_path
+        if not full_pdf_path.exists():
+            print(f"File not found on disk: {full_pdf_path}. Skipping.")
+            return
+
+        file_id = get_unique_file_id(str(rel_path))
+        metadata = dict(row)
+        print(f"\n{'='*50}\nProcessing file: {full_pdf_path}\n{'='*50}")
+    else: # For pass 2 only, we don't need the PDF path, just the ID and metadata
+        file_id = get_unique_file_id(str(rel_path))
+        metadata = dict(row)
+        print(f"\n{'='*50}\nProcessing file ID: {file_id}\n{'='*50}")
+
+    # --- Run the selected pipeline pass(es) ---
+    raw_text_file = os.path.join(DEBUG_STAGING_DIR, f"{file_id}_raw.txt")
+
+    if run_pass_mode in ["1", "all"]:
+        # Run Pass 1, which generates the raw_text_file
+        generated_raw_path = run_pass_1_vision(full_pdf_path, file_id)
+        if not generated_raw_path:
+            print(f"  [Fail] Pass 1 failed for {full_pdf_path}. Skipping Pass 2.")
+            return
+
+    if run_pass_mode in ["2", "all"]:
+        # Run Pass 2, which requires the raw_text_file to exist
+        if os.path.exists(raw_text_file):
+            run_pass_2_logic(raw_text_file, file_id, metadata)
+        else:
+            print(f"  [Fail] Cannot run Pass 2. Raw text file not found at: {raw_text_file}")
+            print("         Please run Pass 1 first (e.g., with --run-pass 1 or --run-pass all).")
+
 def main():
     parser = argparse.ArgumentParser(description="Debug the digitization pipeline on a few random files.")
-    parser.add_argument("subject", type=str, help="The subject to search for (e.g., 'Mathematics').")
-    parser.add_argument("num_pdfs", type=int, nargs='?', default=2, help="Number of random PDF files to process. Default: 2.")
+    parser.add_argument("subject", type=str, help="The subject to search for (e.g., 'Mathematics'). Not used when running only Pass 2.")
+    parser.add_argument("num_files", type=int, nargs='?', default=2, help="Number of random files to process. Default: 2.")
+    parser.add_argument("--run-pass", type=str, default="all", choices=["1", "2", "all"], help="Specify which pass to run. '1' for vision, '2' for logic, 'all' for both. Default: 'all'.")
     args = parser.parse_args()
 
-    records = find_random_pdfs(args.subject, args.num_pdfs)
+    if args.run_pass == '2':
+        records = find_staged_files(args.num_files)
+    else:
+        records = find_random_pdfs(args.subject, args.num_files)
 
     if not records:
         print("No files found to process. Exiting.")
         return
 
     for row in records:
-        # --- Discover PDF path from DB record ---
-        rel_path = None
-        if row['pdfs_json'] and row['pdfs_json'] != "[]":
-            try:
-                pdf_list = json.loads(row['pdfs_json'])
-                if pdf_list:
-                    rel_path = pdf_list[0]['file'] # Just take the first PDF from a zip
-            except json.JSONDecodeError:
-                pass
-        
-        if not rel_path and row['path'] and row['path'].lower().endswith('.pdf'):
-            rel_path = str(Path(row['path']).relative_to(ROOT_OUTPUT_DIR))
-
-        if not rel_path:
-            print(f"Could not determine a PDF path for record URL: {row['complete_url']}. Skipping.")
-            continue
-
-        full_pdf_path = Path(ROOT_OUTPUT_DIR) / rel_path
-        if not full_pdf_path.exists():
-            print(f"File not found on disk: {full_pdf_path}. Skipping.")
-            continue
-
-        file_id = get_unique_file_id(str(rel_path))
-        metadata = dict(row)
-
-        print(f"\n{'='*50}\nProcessing file: {full_pdf_path}\n{'='*50}")
-
-        # --- Run the two passes sequentially ---
-        raw_text_file = run_pass_1_vision(full_pdf_path, file_id)
-
-        if raw_text_file:
-            run_pass_2_logic(raw_text_file, file_id, metadata)
+        process_file(row, args.run_pass)
 
 if __name__ == "__main__":
     main()
