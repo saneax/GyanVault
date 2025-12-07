@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 """
 cbse_papers_crawler.py
-
-Enhanced CBSE question-paper downloader with richer metadata:
- - stores structured URL parts: complete_url, institution, type, year, class, subject
- - stores md5, size, path, content_type, etag, last_modified, ts
- - stores extracted PDF list as JSON in 'pdfs_json' (array of {file, md5, size})
- - md5_map avoids duplicate physical storage
- - DB migration for older DBs
- - polite crawling, HEAD checks, streaming downloads with tqdm, zip extraction, delete zip after extraction
-
-Run:
-    python cbse_papers_crawler.py
+A generic web crawler to download educational papers (PDFs/ZIPs).
+It intelligently extracts metadata (year, class, subject) from URLs and saves files in a structured format.
+It avoids re-downloading content by tracking file hashes (MD5).
 """
-
 import os
 import re
 import io
@@ -24,6 +15,7 @@ import random
 import sqlite3
 import logging
 import hashlib
+import argparse
 import zipfile
 import urllib.robotparser
 from pathlib import Path
@@ -34,8 +26,7 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 from datetime import datetime
 
-# ---------- CONFIG ----------
-START_URL = "https://www.cbse.gov.in/cbsenew/question-paper.html"
+# ---------- CONFIG (Defaults, can be overridden by args) ----------
 OUTPUT_DIR = Path("output")
 DB_PATH = Path("downloads.db")
 
@@ -270,27 +261,30 @@ def dissect_url(url: str):
     """
     Break URL path into institution, type, year, class, subject (best-effort).
     Example:
-      https://www.cbse.gov.in/cbsenew/question-paper/2025-COMPTT/XII/Legal_Studies.zip
-    -> institution=cbsenew, type=question-paper, year=2025, class=XII, subject=Legal_Studies.zip
+      https://some-site.edu/papers/2024/Class-XII/Physics.pdf
+    -> institution=some-site.edu, type=papers, year=2024, class=Class-XII, subject=Physics.pdf
     """
     parsed = urlparse(url)
     parts = [seg for seg in parsed.path.split("/") if seg]
-    institution = parts[0] if len(parts) >= 1 else ""
+    
+    # Institution is derived from the domain name for better generality
+    institution = parsed.netloc.replace("www.", "")
     typ = parts[1] if len(parts) >= 2 else ""
     year = None
     cls = None
     subject = None
-    # If a segment looks like 20xx or starts with 20xx-, treat as year
-    for i, seg in enumerate(parts[2:], start=2):
+
+    # More generic regex to find year and class in URL segments
+    for i, seg in enumerate(parts):
         m = re.match(r"^(20\d{2})", seg)
         if m:
             year = m.group(1)
-            # next segment may be class
+            # Check if the next segment looks like a class/grade
             if i + 1 < len(parts):
                 nxt = parts[i + 1]
-                if re.match(r"^(?:X{1,3}|I|II|III|IV|V|VI|VII|VIII|IX|XI|XII|[0-9]{1,2}|Class[_\- ]?[0-9]{1,2})$", nxt, flags=re.I):
+                if re.match(r"^(?:X{1,3}|I{1,3}V?|IV|V|VI{1,3}|IX|XI{0,2}|[0-9]{1,2}|Class-?[0-9]{1,2})$", nxt, flags=re.I):
                     cls = nxt
-            break
+
     # subject fallback: last path part or filename
     if parts:
         subject = parts[-1]
@@ -447,21 +441,27 @@ def extract_pdfs_from_zip(zip_path: Path, target_folder: Path):
 
 # ---------- main ----------
 def main():
+    parser = argparse.ArgumentParser(description="A generic crawler for academic papers.")
+    parser.add_argument("start_url", type=str, help="The starting URL to crawl for papers.")
+    args = parser.parse_args()
+
+    start_url = args.start_url
+
     conn = init_db(DB_PATH)
     session = get_session()
     TEMP_DIR.mkdir(exist_ok=True)
 
-    if not allowed_by_robots(START_URL):
+    if not allowed_by_robots(start_url):
         logging.error("robots.txt disallows crawling the start URL. Exiting.")
         return
 
     headers = {"User-Agent": random.choice(USER_AGENTS)}
-    logging.info(f"Fetching start page: {START_URL}")
-    r = session.get(START_URL, headers=headers, timeout=TIMEOUT)
+    logging.info(f"Fetching start page: {start_url}")
+    r = session.get(start_url, headers=headers, timeout=TIMEOUT)
     r.raise_for_status()
     html = r.text
 
-    queue = parse_and_queue_downloads(html, START_URL)
+    queue = parse_and_queue_downloads(html, start_url)
     logging.info(f"Found {len(queue)} candidate downloads")
 
     for idx, item in enumerate(queue, 1):
@@ -481,14 +481,13 @@ def main():
             continue
 
         # HEAD info (etag)
-        head = head_check(session, url, referer=START_URL)
+        head = head_check(session, url, referer=start_url)
         if head and head.get("etag"):
             logging.debug(f"HEAD ETag: {head.get('etag')} for {url}")
 
         polite_sleep()
 
         # compute structured fields from URL (defensive)
-        dissected = dissect_url(url)
         institution = inst or dissected.get("institution") or ""
         typ_field = typ or dissected.get("type") or ""
         year = year_from_item or dissected.get("year") or ""
@@ -501,7 +500,7 @@ def main():
         fname = Path(urlparse(url).path).name or (sanitize(subject) + ".pdf")
         temp_path = TEMP_DIR / (hashlib.sha1(url.encode()).hexdigest() + ".tmp")
 
-        info = stream_download_to_temp(session, url, temp_path, referer=START_URL)
+        info = stream_download_to_temp(session, url, temp_path, referer=start_url)
         if not info:
             logging.warning(f"Failed to download {url}")
             continue
@@ -615,4 +614,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

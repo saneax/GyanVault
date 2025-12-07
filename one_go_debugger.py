@@ -152,6 +152,35 @@ def run_pass_1_vision(pdf_path, file_id):
 
     return raw_text_path
 
+def parse_and_fix_json(json_str: str) -> dict | None:
+    """
+    A more robust JSON parser that attempts to fix common LLM-generated errors,
+    especially around unescaped backslashes.
+    """
+    # 1. Find the main JSON object
+    start_index = json_str.find('{')
+    end_index = json_str.rfind('}')
+    if start_index == -1 or end_index == -1:
+        return None
+    json_str = json_str[start_index : end_index + 1]
+
+    # 2. Iteratively try to fix and parse
+    for i in range(5): # Try to fix up to 5 times
+        try:
+            # Attempt to remove trailing commas before closing brackets/braces
+            clean_str = re.sub(r",\s*([}\]])", r"\1", json_str)
+            return json.loads(clean_str)
+        except json.JSONDecodeError as e:
+            # If it's an escape error, find the problematic character and escape it
+            if "Invalid \\escape" in str(e):
+                # The error message gives us the position of the bad character
+                bad_char_pos = e.pos + (json_str.find('{') if json_str.find('{') > -1 else 0)
+                # Insert an extra backslash right before the problematic character
+                json_str = json_str[:bad_char_pos] + '\\' + json_str[bad_char_pos:]
+            else: # For other errors, we can't reliably fix them
+                raise e # Re-raise the exception to be caught outside
+    return None
+
 def run_pass_2_logic(raw_text_path, file_id, metadata):
     """Runs the logic model to convert raw text to structured JSON."""
     print("\n" + "="*30)
@@ -173,16 +202,29 @@ def run_pass_2_logic(raw_text_path, file_id, metadata):
         # CHUNKING IMPLEMENTED: Process the document page by page.
         system_prompt = """
 <|im_start|>system
-You are an expert data extraction engine for academic papers. Your task is to convert the provided text into a single, valid JSON object.
+You are an expert teacher and data extractor for academic papers. Your task is to convert the provided text into a single, valid JSON object.
 
 CRITICAL RULES:
-1. You MUST output a single, valid JSON object and nothing else. Do not use markdown.
-2. You MUST escape all backslashes for JSON compatibility. For example, `\sin` becomes `"\\sin"`.
-3. Extract all questions, including their number, text, options (for MCQs), and marks.
-4. Ignore any leftover instructional text or page markers. Focus only on the questions.
-5. The output must be a JSON object containing a single key "questions", which is a list of question objects.
-<|im_end|>
-"""
+1.  You MUST output a single, valid JSON object and nothing else. Do not use markdown.
+2.  You MUST escape all backslashes for JSON compatibility. For example, `\sin` must be written as `"\\sin"`.
+3.  Extract questions, their options (for MCQs), and marks.
+4.  For the "answer" field, provide a detailed, step-by-step walkthrough of how to arrive at the correct answer. Behave like a teacher explaining the concept.
+5.  Ignore any leftover instructional text or page markers. Focus only on the questions.
+6.  The output must be a JSON object containing a single key "questions", which is a list of question objects.
+
+EXAMPLE JSON STRUCTURE:
+{{
+  "questions": [
+    {{
+      "q_no": "1",
+      "text": "If \\(100 \\equiv x(\\bmod 7)\\), then the least positive value of \\(x\\) is:",
+      "options": ["(a) 6", "(b) 4", "(c) 3", "(d) 2"],
+      "marks": "1",
+      "answer": "The correct option is (d) 2. The expression \\(100 \\equiv x(\\bmod 7)\\) means that 100 and x have the same remainder when divided by 7. First, we divide 100 by 7. 100 divided by 7 is 14 with a remainder of 2 (since 14 * 7 = 98). Therefore, the remainder is 2. The question asks for the least positive value of x, which is this remainder. So, x = 2."
+    }}
+  ]
+}}
+<|im_end|>"""
 
         with open(raw_text_path, "r", encoding="utf-8") as f:
             raw_text = f.read()
@@ -209,17 +251,14 @@ PAGE TEXT TO CONVERT:
             inputs = tokenizer([system_prompt + user_prompt], return_tensors="pt").to("cuda")
 
             with torch.no_grad():
-                outputs = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, max_new_tokens=3072, temperature=0.1, pad_token_id=tokenizer.eos_token_id)
+                outputs = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, max_new_tokens=3072, temperature=0.05, do_sample=True, pad_token_id=tokenizer.eos_token_id)
 
             generated_ids = [out[len(inp):] for inp, out in zip(inputs.input_ids, outputs)]
             json_str = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
             try:
-                clean_json_str = json_str[json_str.find('{') : json_str.rfind('}')+1]
-                if not clean_json_str: continue
-
-                corrected_json_str = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', clean_json_str)
-                parsed_json = json.loads(corrected_json_str)
+                parsed_json = parse_and_fix_json(json_str)
+                if not parsed_json: continue
 
                 if "questions" in parsed_json and isinstance(parsed_json["questions"], list):
                     all_questions.extend(parsed_json["questions"])
